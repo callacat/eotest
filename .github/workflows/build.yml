@@ -3,8 +3,12 @@ name: Build Binary Tool
 on:
   push:
     tags:
-      - 'v*' # 只有打 tag (如 v1.0.0) 时才触发构建发布，平时 push 代码不构建
-  workflow_dispatch: # 允许手动点按钮触发
+      - 'v*' # 只有打 tag 时触发
+  workflow_dispatch: # 允许手动触发
+
+# 关键：必须赋予写权限，否则无法删除旧 Release
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -17,7 +21,7 @@ jobs:
             name: smartdns-linux-amd64
           - goos: linux
             goarch: arm64
-            name: smartdns-linux-arm64 # 适用于 ARM 软路由/树莓派/Oracle Cloud ARM
+            name: smartdns-linux-arm64
 
     steps:
     - uses: actions/checkout@v4
@@ -26,6 +30,8 @@ jobs:
       uses: actions/setup-go@v4
       with:
         go-version: '1.20'
+        # 如果你还没有上传 go.sum，可以将 cache 设置为 false 来消除警告
+        cache: false 
 
     - name: Download dependencies
       run: |
@@ -35,7 +41,7 @@ jobs:
       env:
         GOOS: ${{ matrix.goos }}
         GOARCH: ${{ matrix.goarch }}
-        CGO_ENABLED: 0 # 静态编译，不依赖系统库
+        CGO_ENABLED: 0
       run: |
         go build -ldflags="-s -w" -o build/${{ matrix.name }} main.go
 
@@ -50,9 +56,25 @@ jobs:
       if: startsWith(github.ref, 'refs/tags/')
       with:
         files: build/*
-    
+
     - name: Delete workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
             retain_days: 0
-            keep_minimum_runs: 2
+            keep_minimum_runs: 3
+    
+  # 新增的任务：清理旧版本
+  clean-releases:
+    needs: build # 只有构建成功后才清理
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete Older Releases
+        uses: dev-drprasad/delete-older-releases@v0.3.3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          # 保留最新的几个版本？(建议保留3个，以防最新版有问题可以回退)
+          keep_latest: 3
+          # 是否连同 Tag 一起删除？(通常选 true，保持 git log 干净)
+          delete_tags: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
