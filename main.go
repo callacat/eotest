@@ -42,7 +42,7 @@ type Result struct {
 	Latency float64
 }
 
-// 全局变量，用于在 preCheck 阶段缓存找到的 RecordID，避免最后重复查询
+// 全局变量，用于在 preCheck 阶段缓存找到的 RecordID
 var cachedRecordID string
 
 func main() {
@@ -125,7 +125,6 @@ func main() {
 	fmt.Printf("[5/5] 准备更新 DNS (%s)\n", cfg.Domain)
 	fmt.Printf("      选中 IP: %v\n", bestIPs)
 	
-	// 这里直接使用 cachedRecordID，不再重复查询
 	if err := updateHuaweiDNS(cfg, bestIPs); err != nil {
 		fmt.Printf("❌ 更新失败: %v\n", err)
 		os.Exit(1)
@@ -133,7 +132,7 @@ func main() {
 	fmt.Println("[5/5] 全部完成！SUCCESS")
 }
 
-// 【核心新增】前置检查函数
+// 【修复后】前置检查函数
 func preCheckDNS(cfg Config) error {
 	client, err := getDNSClient(cfg)
 	if err != nil {
@@ -154,7 +153,6 @@ func preCheckDNS(cfg Config) error {
 	
 	resp, err := client.ListRecordSetsByZone(listReq)
 	if err != nil {
-		// 转换错误信息，使其更易读
 		errMsg := err.Error()
 		if strings.Contains(errMsg, "APIGW.0301") {
 			return fmt.Errorf("鉴权失败 (401)。请检查：\n1. ProjectID [%s] 是否属于 Region [%s]\n2. AK/SK 是否正确", cfg.ProjectID, cfg.Region)
@@ -165,30 +163,17 @@ func preCheckDNS(cfg Config) error {
 		return err
 	}
 
-	// 鉴权通过，开始查找特定记录
 	if resp.Recordsets == nil || len(*resp.Recordsets) == 0 {
 		return fmt.Errorf("该 Zone [%s] 下没有任何记录", cfg.ZoneID)
 	}
 
-	// 遍历查找完全匹配的记录
-	var foundRecord *model.RecordSet
-	
-	// 调试日志：打印出前几个记录，帮用户排查域名写错的问题
-	// fmt.Println("      [Debug] API 返回的记录列表 (前5条):")
-	for i, r := range *resp.Recordsets {
-		// if i < 5 {
-		// 	fmt.Printf("      - Name: %s | Type: %s | ID: %s\n", *r.Name, *r.Type, *r.Id)
-		// }
-		
+	// 修复：删除 var foundRecord *model.RecordSet 定义
+	// 直接遍历查找，找到即返回
+	for _, r := range *resp.Recordsets {
 		if r.Name != nil && *r.Name == searchDomain && r.Type != nil && *r.Type == "A" {
-			foundRecord = &(*resp.Recordsets)[i]
-			break
+			cachedRecordID = *r.Id
+			return nil // 找到就直接退出，不需要中间变量
 		}
-	}
-
-	if foundRecord != nil {
-		cachedRecordID = *foundRecord.Id
-		return nil
 	}
 
 	// 如果没找到，打印详细的诊断信息
