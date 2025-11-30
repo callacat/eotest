@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
+	"context" // 必须引入 context 包
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -42,12 +42,12 @@ func main() {
 	// 1. 定义和解析命令行参数
 	cfg := Config{}
 	flag.StringVar(&cfg.ListURL, "u", "", "IP列表下载地址 (http/https)")
-	flag.StringVar(&cfg.TargetURL, "t", "", "测速目标URL (用于验证连通性)")
+	flag.StringVar(&cfg.TargetURL, "t", "", "测速目标URL")
 	flag.StringVar(&cfg.AK, "ak", "", "华为云 Access Key")
 	flag.StringVar(&cfg.SK, "sk", "", "华为云 Secret Key")
 	flag.StringVar(&cfg.ZoneID, "zone", "", "华为云 Zone ID")
 	flag.StringVar(&cfg.Domain, "domain", "", "要更新的完整域名 (不带末尾点)")
-	flag.StringVar(&cfg.Region, "region", "cn-east-3", "华为云区域 (默认 cn-east-3)")
+	flag.StringVar(&cfg.Region, "region", "cn-east-3", "华为云区域")
 	flag.IntVar(&cfg.Threads, "n", 20, "并发线程数")
 	flag.Parse()
 
@@ -127,10 +127,12 @@ func runSpeedTest(ips []string, targetURL string, concurrency int) string {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 强制指定 IP 连接
+			// 修复点1: 正确使用 context 和 dialer
 			dialer := &net.Dialer{Timeout: 3 * time.Second}
 			transport := &http.Transport{
-				DialContext: func(ctx, network, addr string) (net.Conn, error) {
+				// 这里必须匹配 func(context.Context, string, string)
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					// 忽略 addr 中的域名，强制连接到 testIP
 					return dialer.DialContext(ctx, network, testIP+":"+port)
 				},
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
@@ -144,7 +146,7 @@ func runSpeedTest(ips []string, targetURL string, concurrency int) string {
 				latency := float64(time.Since(start).Milliseconds())
 				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 					results <- Result{IP: testIP, Latency: latency}
-					fmt.Printf(".") // 进度条效果
+					fmt.Printf(".") 
 				}
 			}
 		}(ip)
@@ -183,25 +185,28 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 			WithCredential(auth).
 			Build())
 
-	// 1. 必须先搜索到 Record ID
-	listReq := &model.ListRecordSetsRequest{}
-	listReq.ZoneId = &cfg.ZoneID
-	listReq.Name = &cfg.Domain // 搜索该域名
-	resp, err := client.ListRecordSets(listReq)
-	if err != nil {
-		return fmt.Errorf("查询记录集失败: %v", err)
-	}
-
-	var recordID string
-	// 华为云返回的 Name 默认带点，需要处理
+	// 处理域名末尾的点
 	searchDomain := cfg.Domain
 	if !strings.HasSuffix(searchDomain, ".") {
 		searchDomain += "."
 	}
 
+	// 修复点2: 使用 ListRecordSetsByZoneRequest 来配合 ZoneID 搜索
+	// 这样才能确保 ZoneId 字段有效
+	listReq := &model.ListRecordSetsByZoneRequest{}
+	listReq.ZoneId = cfg.ZoneID
+	listReq.Name = &searchDomain // 在该Zone下搜索此域名
+	
+	resp, err := client.ListRecordSetsByZone(listReq)
+	if err != nil {
+		return fmt.Errorf("查询记录集失败: %v", err)
+	}
+
+	var recordID string
 	if resp.Recordsets != nil {
 		for _, r := range *resp.Recordsets {
-			if r.Name != nil && *r.Name == searchDomain {
+			// 确保名字匹配且类型为A记录
+			if r.Name != nil && *r.Name == searchDomain && r.Type != nil && *r.Type == "A" {
 				recordID = *r.Id
 				break
 			}
@@ -209,7 +214,7 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 	}
 
 	if recordID == "" {
-		return fmt.Errorf("未在 Zone 中找到域名 %s 的记录，请先手动创建一条。", cfg.Domain)
+		return fmt.Errorf("未在 Zone 中找到域名 %s 的 A 记录，请先手动创建。", cfg.Domain)
 	}
 
 	// 2. 更新记录
@@ -217,10 +222,14 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 		ZoneId:      cfg.ZoneID,
 		RecordsetId: recordID,
 	}
+	
+	// 修复点3: 构造切片并取地址
+	newRecords := []string{ip}
+	
 	body := &model.UpdateRecordSetReq{
-		Records: []string{ip},
+		Records: &newRecords, // 必须传指针
 		Type:    "A",
-		Ttl:     io.Pointer(int32(300)), // 5分钟 TTL
+		Ttl:     Pointer(int32(300)), // 修复点4: 使用正确的辅助函数
 		Name:    searchDomain,
 	}
 	updateReq.Body = body
@@ -229,7 +238,7 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 	return err
 }
 
-// 辅助函数：生成指针 (Go SDK 需要)
+// 辅助函数：生成指针
 func Pointer[T any](v T) *T {
 	return &v
 }
