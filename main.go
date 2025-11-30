@@ -28,11 +28,13 @@ type Config struct {
 	TargetURL string
 	AK        string
 	SK        string
-	ProjectID string // 新增：项目ID，解决鉴权报错
+	ProjectID string // 项目ID
 	ZoneID    string
 	Domain    string
 	Region    string
 	Threads   int
+	TopN      int    // 新增：更新前N个IP
+	OutFile   string // 新增：结果保存路径
 }
 
 type Result struct {
@@ -48,11 +50,13 @@ func main() {
 	flag.StringVar(&cfg.TargetURL, "t", "", "测速目标URL")
 	flag.StringVar(&cfg.AK, "ak", "", "华为云 Access Key")
 	flag.StringVar(&cfg.SK, "sk", "", "华为云 Secret Key")
-	flag.StringVar(&cfg.ProjectID, "pid", "", "华为云 Project ID (必填，解决401报错)")
+	flag.StringVar(&cfg.ProjectID, "pid", "", "华为云 Project ID (解决401报错)")
 	flag.StringVar(&cfg.ZoneID, "zone", "", "华为云 Zone ID")
 	flag.StringVar(&cfg.Domain, "domain", "", "要更新的完整域名")
 	flag.StringVar(&cfg.Region, "region", "cn-east-3", "华为云区域")
 	flag.IntVar(&cfg.Threads, "n", 20, "并发线程数")
+	flag.IntVar(&cfg.TopN, "top", 1, "更新延迟最低的前 N 个 IP 到 DNS (默认1，华为云最多支持50)")
+	flag.StringVar(&cfg.OutFile, "o", "result.txt", "测速结果保存文件")
 	flag.Parse()
 
 	// 1. 参数校验
@@ -68,7 +72,7 @@ func main() {
 	}
 
 	// 2. 获取 IP 列表
-	fmt.Println("[1/4] 获取 IP 列表...")
+	fmt.Println("[1/5] 获取 IP 列表...")
 	ips, err := getIPs(cfg)
 	if err != nil {
 		fmt.Printf("获取失败: %v\n", err)
@@ -77,30 +81,53 @@ func main() {
 	fmt.Printf("      成功加载 %d 个 IP\n", len(ips))
 
 	// 3. 测速
-	fmt.Printf("[2/4] 开始测速 (Target: %s, Threads: %d)\n", cfg.TargetURL, cfg.Threads)
-	bestIP := runSpeedTest(ips, cfg.TargetURL, cfg.Threads)
-	if bestIP == "" {
+	fmt.Printf("[2/5] 开始测速 (Target: %s, Threads: %d)\n", cfg.TargetURL, cfg.Threads)
+	allResults := runSpeedTest(ips, cfg.TargetURL, cfg.Threads)
+	
+	if len(allResults) == 0 {
 		fmt.Println("      未找到可用 IP，程序退出。")
 		os.Exit(1)
 	}
-	fmt.Printf("      最优 IP: %s\n", bestIP)
 
-	// 4. 更新 DNS
-	fmt.Printf("[3/4] 更新华为云 DNS (%s -> %s)\n", cfg.Domain, bestIP)
-	if err := updateHuaweiDNS(cfg, bestIP); err != nil {
-		fmt.Printf("      更新失败: %v\n", err)
+	// 4. 保存结果
+	fmt.Printf("[3/5] 保存结果到 %s\n", cfg.OutFile)
+	if err := saveResults(allResults, cfg.OutFile); err != nil {
+		fmt.Printf("      保存失败: %v\n", err)
+	} else {
+		fmt.Printf("      已保存 %d 条有效记录\n", len(allResults))
+	}
+
+	// 5. 选取 Top N 并更新 DNS
+	count := cfg.TopN
+	if count > len(allResults) {
+		count = len(allResults)
+	}
+	if count > 50 {
+		count = 50 // 华为云强制限制
+		fmt.Println("      提示: 更新数量已自动限制为 50 (平台上限)")
+	}
+
+	bestIPs := make([]string, count)
+	for i := 0; i < count; i++ {
+		bestIPs[i] = allResults[i].IP
+	}
+
+	fmt.Printf("[4/5] 准备更新 DNS (%s)\n", cfg.Domain)
+	fmt.Printf("      选中 IP (%d个): %v\n", len(bestIPs), bestIPs)
+	
+	if err := updateHuaweiDNS(cfg, bestIPs); err != nil {
+		fmt.Printf("[5/5] 更新失败: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Println("[4/4] 全部完成！SUCCESS")
+	fmt.Println("[5/5] 全部完成！SUCCESS")
 }
 
-// 统一获取 IP 逻辑：优先读取本地文件，没有则下载
+// 统一获取 IP 逻辑
 func getIPs(cfg Config) ([]string, error) {
 	var scanner *bufio.Scanner
 	var sourceName string
 
 	if cfg.FilePath != "" {
-		// 读取本地文件
 		sourceName = "Local File: " + cfg.FilePath
 		file, err := os.Open(cfg.FilePath)
 		if err != nil {
@@ -109,7 +136,6 @@ func getIPs(cfg Config) ([]string, error) {
 		defer file.Close()
 		scanner = bufio.NewScanner(file)
 	} else {
-		// 下载网络文件
 		sourceName = "Remote URL: " + cfg.ListURL
 		resp, err := http.Get(cfg.ListURL)
 		if err != nil {
@@ -124,7 +150,6 @@ func getIPs(cfg Config) ([]string, error) {
 	var ips []string
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// 忽略空行和注释
 		if line != "" && !strings.HasPrefix(line, "#") {
 			ips = append(ips, line)
 		}
@@ -132,8 +157,8 @@ func getIPs(cfg Config) ([]string, error) {
 	return ips, nil
 }
 
-// 测速核心逻辑 (保持不变)
-func runSpeedTest(ips []string, targetURL string, concurrency int) string {
+// 测速核心逻辑 (返回完整的排序后的结果列表)
+func runSpeedTest(ips []string, targetURL string, concurrency int) []Result {
 	u, _ := url.Parse(targetURL)
 	host := u.Hostname()
 	port := u.Port()
@@ -187,24 +212,39 @@ func runSpeedTest(ips []string, targetURL string, concurrency int) string {
 		validResults = append(validResults, r)
 	}
 
-	if len(validResults) == 0 {
-		return ""
-	}
-
+	// 排序
 	sort.Slice(validResults, func(i, j int) bool {
 		return validResults[i].Latency < validResults[j].Latency
 	})
 
-	return validResults[0].IP
+	return validResults
 }
 
-// 华为云 DNS 更新逻辑
-func updateHuaweiDNS(cfg Config, ip string) error {
-	// 修复：显式传入 ProjectId，避免 SDK 自动请求 IAM 导致 401 报错
+// 保存结果到本地文件
+func saveResults(results []Result, filepath string) error {
+	f, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	w := bufio.NewWriter(f)
+	// 写入表头
+	fmt.Fprintln(w, "IP地址\t\t延迟(ms)")
+	fmt.Fprintln(w, "--------------------------")
+	
+	for _, res := range results {
+		fmt.Fprintf(w, "%-15s\t%.2f\n", res.IP, res.Latency)
+	}
+	return w.Flush()
+}
+
+// 华为云 DNS 更新逻辑 (支持多IP)
+func updateHuaweiDNS(cfg Config, ips []string) error {
 	auth := basic.NewCredentialsBuilder().
 		WithAk(cfg.AK).
 		WithSk(cfg.SK).
-		WithProjectId(cfg.ProjectID). // 关键修改
+		WithProjectId(cfg.ProjectID).
 		Build()
 
 	client := dns.NewDnsClient(
@@ -242,15 +282,13 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 		return fmt.Errorf("未在 Zone 中找到域名 %s 的 A 记录", cfg.Domain)
 	}
 
-	// 2. 更新记录
-	newRecords := []string{ip}
-	
+	// 2. 更新记录 (传入 IP 列表)
 	updateReq := &model.UpdateRecordSetRequest{
 		ZoneId:      cfg.ZoneID,
 		RecordsetId: recordID,
 	}
 	body := &model.UpdateRecordSetReq{
-		Records: &newRecords,
+		Records: &ips, // 指针指向字符串切片
 		Type:    "A",
 		Ttl:     Pointer(int32(300)),
 		Name:    searchDomain,
@@ -264,3 +302,20 @@ func updateHuaweiDNS(cfg Config, ip string) error {
 func Pointer[T any](v T) *T {
 	return &v
 }
+```
+
+### 新增功能使用示例
+
+**场景：** 读取本地 `ips.txt`，将测速结果保存到 `log.txt`，并且选出延迟最低的 **3** 个 IP 更新到 DNS。
+
+```bash
+./smartdns-linux-amd64 \
+  -f "ips.txt" \
+  -t "https://test.dsurl.eu.org" \
+  -domain "eo-arm.dsurl.eu.org" \
+  -zone "ZoneID..." \
+  -ak "AK..." \
+  -sk "SK..." \
+  -pid "ProjectID..." \
+  -top 3 \
+  -o "log.txt"
