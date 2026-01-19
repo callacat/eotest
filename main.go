@@ -39,6 +39,7 @@ type Config struct {
 	// 新增参数
 	Timeout   int    // 超时时间(ms)
 	MatchStr  string // 响应内容校验字符串
+	TTL       int    // DNS TTL值
 }
 
 type Result struct {
@@ -67,6 +68,7 @@ func main() {
 	// 新增参数
 	flag.IntVar(&cfg.Timeout, "timeout", 2000, "测速超时时间 (ms，默认 2000)")
 	flag.StringVar(&cfg.MatchStr, "match", "", "响应内容需包含的字符串 (可选，用于校验内容防止假200)")
+	flag.IntVar(&cfg.TTL, "ttl", 60, "DNS记录的TTL值 (默认60)")
 	
 	flag.Parse()
 
@@ -134,7 +136,7 @@ func main() {
 		bestIPs[i] = allResults[i].IP
 	}
 
-	fmt.Printf("[5/5] 准备更新 DNS (%s)\n", cfg.Domain)
+	fmt.Printf("[5/5] 准备更新 DNS (%s, TTL: %d)\n", cfg.Domain, cfg.TTL)
 	fmt.Printf("      选中 IP: %v\n", bestIPs)
 	
 	if err := updateHuaweiDNS(cfg, bestIPs); err != nil {
@@ -159,7 +161,7 @@ func preCheckDNS(cfg Config) error {
 	// 构造请求：直接让服务端过滤 Name
 	listReq := &model.ListRecordSetsByZoneRequest{
 		ZoneId: cfg.ZoneID,
-		Name:   &searchDomain, // 【优化点】直接指定 Name，解决记录过多翻页找不到的问题
+		Name:   &searchDomain, 
 	}
 	
 	resp, err := client.ListRecordSetsByZone(listReq)
@@ -389,17 +391,20 @@ func updateHuaweiDNS(cfg Config, ips []string) error {
 		ZoneId:      cfg.ZoneID,
 		RecordsetId: cachedRecordID,
 	}
+	// 使用命令行配置的 TTL
+	ttlVal := int32(cfg.TTL)
+
 	body := &model.UpdateRecordSetReq{
 		Records: &ips,
 		Type:    "A",
-		Ttl:     Pointer(int32(300)),
+		Ttl:     Pointer(ttlVal),
 		Name:    searchDomain,
 	}
 	updateReq.Body = body
 
 	resp, err := client.UpdateRecordSet(updateReq)
 	if err == nil {
-		fmt.Printf("      ✅ 更新成功! Name: %s, Records: %v\n", *resp.Name, *resp.Records)
+		fmt.Printf("      ✅ 更新成功! Name: %s, TTL: %d, Records: %v\n", *resp.Name, *resp.Ttl, *resp.Records)
 	}
 	return err
 }
